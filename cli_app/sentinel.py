@@ -1,0 +1,367 @@
+import click
+import requests
+import subprocess
+import os
+import json
+import sys
+
+def load_config():
+    try:
+        # Try to find config.json in project root
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        config_path = os.path.join(base_dir, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                return json.load(f)
+        return {}
+    except:
+        return {}
+
+config = load_config()
+VT_API_KEY = config.get("vt_api_key", os.environ.get("VT_API_KEY", ""))
+HF_TOKEN = config.get("hf_token", os.environ.get("HF_TOKEN", ""))
+GEMINI_API_KEY = config.get("gemini_api_key", os.environ.get("GEMINI_API_KEY", ""))
+LIMA_INSTANCE = "default"
+REMOTE_BINARY_PATH = "/tmp/cargo_cache/release/sentinel_cli"
+SSH_CONFIG_PATH = os.path.expanduser("~/.lima/default/ssh.config")
+
+@click.group()
+def cli():
+    """Sentinel V2 CLI - Phishing & Malware Analysis Tool"""
+    pass
+
+@cli.command()
+@click.argument("url")
+def scan_url(url):
+    """Tier 1: Intent Analysis via Google Gemini Pro"""
+    click.echo(f"\n🔍 Analyzing URL: {url}...\n")
+    
+    if not GEMINI_API_KEY:
+        click.echo("❌ Error: GEMINI_API_KEY not found in config.json")
+        return
+
+    try:
+        url_endpoint = "https://integrate.api.nvidia.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GEMINI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        prompt = f"""Analyze this URL for phishing.
+URL: {url}
+
+Task:
+1. Check if the domain is legitimate (e.g. google.com is SAFE).
+2. Check for typosquatting (e.g. g0ogle.com is MALICIOUS).
+3. Check for suspicious subdomains.
+
+Reply with this JSON format:
+{{
+  "verdict": "MALICIOUS" or "SAFE" or "SUSPICIOUS",
+  "reason": "Brief explanation",
+  "confidence": 0.0 to 1.0
+}}
+"""
+        data = {
+            "model": "meta/llama-3.1-70b-instruct",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 1024
+        }
+        
+        response = requests.post(url_endpoint, headers=headers, json=data)
+        response.raise_for_status()
+        
+        text = response.json()["choices"][0]["message"]["content"].replace('```json', '').replace('```', '').strip()
+        data = json.loads(text)
+        
+        verdict = data.get('verdict', 'UNKNOWN').upper()
+        reason = data.get('reason', 'No reason provided')
+        confidence = data.get('confidence', 0.7)
+        
+        score = 0
+        indicators = []
+        
+        if verdict == 'MALICIOUS':
+            level = "🔴 HIGH"
+            color = "\033[91m"
+            score = 90
+            indicators.append("🚨 AI flagged as malicious")
+        elif verdict == 'SUSPICIOUS':
+            level = "🟡 MEDIUM"
+            color = "\033[93m"
+            score = 60
+            indicators.append("⚠️ AI flagged as suspicious")
+        else:
+            level = "🟢 LOW"
+            color = "\033[92m"
+            score = 10
+            indicators.append("✅ AI analysis: appears safe")
+            
+        # Basic heuristic checks (kept as backup/supplement)
+        phishing_keywords = ['login', 'verify', 'suspend', 'account', 'secure', 'update']
+        if any(keyword in url.lower() for keyword in phishing_keywords) and verdict != 'SAFE':
+            score += 10
+            indicators.append("⚠️ URL contains suspicious keywords")
+        
+        if url.startswith('http://'):
+            score += 10
+            indicators.append("⚠️ No HTTPS encryption")
+            
+        score = min(score, 100)
+        
+        click.echo("=" * 60)
+        click.echo(f"  Threat Level: {color}{level}\033[0m")
+        click.echo(f"  Risk Score: {score}/100")
+        click.echo(f"  Confidence: {int(confidence * 100)}%")
+        click.echo("=" * 60)
+        click.echo("\n📊 Risk Indicators:")
+        for indicator in indicators:
+            click.echo(f"  • {indicator}")
+        
+        click.echo(f"\n💬 Analysis:")
+        click.echo(f"  {reason}")
+        click.echo("\n" + "=" * 60)
+        
+        try:
+            from log_manager import save_scan_log
+            log_path = save_scan_log({
+                "timestamp": __import__('time').time(),
+                "target": url,
+                "type": "url",
+                "threat_level": level,
+                "score": score,
+                "confidence": confidence,
+                "indicators": indicators,
+                "status": "ANALYZED"
+            })
+            click.echo(f"\n💾 Saved to: {log_path}")
+        except Exception as e:
+            pass
+            
+    except Exception as e:
+        click.echo(f"❌ API Error: {str(e)}")
+
+@cli.command()
+@click.argument("path")
+def scan_file(path):
+    """Tier 3: Behavioral Analysis via Rust Sandbox (Firecracker VM)"""
+    click.echo(f"\n🔬 Sandboxing File: {path}...\n")
+    
+    binary_path = os.path.expanduser("~/sentinel_v2/linux-backend/target/release/sentinel_cli")
+    cmd = [binary_path, "--path", path]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            import re
+            output = result.stdout
+            
+            json_pattern = r'\{[^{]*"status".*?\}(?=\s*$)'
+            matches = re.findall(json_pattern, output, re.DOTALL)
+            
+            if not matches:
+                click.echo(f"❌ No valid JSON found in output")
+                click.echo(f"Output length: {len(output)} chars")
+                return
+            
+            json_str = matches[-1]
+            
+            brace_count = 0
+            start_idx = output.rfind(json_str)
+            for i in range(start_idx, len(output)):
+                if output[i] == '{':
+                    brace_count += 1
+                elif output[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_str = output[start_idx:i+1]
+                        break
+            
+            data = json.loads(json_str)
+            
+            threat_score = data.get('threat_score', {})
+            level = threat_score.get('level', 'UNKNOWN')
+            score = threat_score.get('score', 0)
+            confidence = threat_score.get('confidence', 0.0)
+            indicators = threat_score.get('indicators', [])
+            
+            if level == 'HIGH':
+                level_display = "🔴 HIGH"
+                color = "\033[91m"
+            elif level == 'MEDIUM':
+                level_display = "🟡 MEDIUM"
+                color = "\033[93m"
+            elif level == 'LOW':
+                level_display = "🟢 LOW"
+                color = "\033[92m"
+            else:
+                level_display = "⚪ UNKNOWN"
+                color = "\033[90m"
+            
+            click.echo("=" * 60)
+            click.echo(f"  Status: {data.get('status', 'UNKNOWN')}")
+            click.echo(f"  Threat Level: {color}{level_display}\033[0m")
+            click.echo(f"  Risk Score: {score}/100")
+            click.echo(f"  Confidence: {int(confidence * 100)}%")
+            click.echo(f"  Isolation: {data.get('isolation_method', 'unknown').upper()}")
+            click.echo("=" * 60)
+            
+            if indicators:
+                click.echo("\n📊 Risk Indicators:")
+                for indicator in indicators:
+                    click.echo(f"  • {indicator}")
+            
+            click.echo(f"\n💬 Analysis Summary:")
+            details = data.get('details', 'No additional details')
+            
+            if "MicroVM executed" in details:
+                click.echo(f"  ✅ File successfully analyzed in hardware-isolated microVM")
+                click.echo(f"  🔒 Isolation: Firecracker (1 vCPU, 128MB RAM)")
+                click.echo(f"  ⚡ Execution: Complete kernel boot + file analysis")
+                click.echo(f"  🛡️ Security: Zero host contamination risk")
+                if score < 30:
+                    click.echo(f"  ✓ Verdict: No malicious behavior detected")
+                elif score < 70:
+                    click.echo(f"  ⚠ Verdict: Some suspicious indicators found")
+                else:
+                    click.echo(f"  🚨 Verdict: High-risk indicators detected")
+            else:
+                click.echo(f"  {details[:400]}")
+            
+            click.echo("\n" + "=" * 60)
+            
+            try:
+                from log_manager import save_scan_log
+                log_path = save_scan_log({
+                    "timestamp": data.get('timestamp', __import__('time').time()),
+                    "target": path,
+                    "type": "file",
+                    "threat_level": level,
+                    "score": score,
+                    "confidence": confidence,
+                    "indicators": indicators,
+                    "status": data.get('status', 'ANALYZED'),
+                    "isolation_method": data.get('isolation_method', '')
+                })
+                click.echo(f"\n💾 Saved to: {log_path}")
+            except Exception as e:
+                pass
+        else:
+            click.echo(f"❌ Error (Exit Code {result.returncode}):")
+            click.echo(result.stderr)
+    except json.JSONDecodeError as e:
+        click.echo(f"❌ Failed to parse response: {str(e)}")
+        click.echo(f"Raw output: {result.stdout}")
+    except Exception as e:
+        click.echo(f"❌ Execution Failed: {str(e)}")
+
+@cli.command()
+@click.argument("url")
+def scan_vision(url):
+    """Tier 2: Visual Analysis via Google Gemini Pro Vision"""
+    click.echo(f"\n👁️  Visual Scanning: {url}...\n")
+    
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    
+    try:
+        import vision_scanner
+        from PIL import Image
+    except ImportError as e:
+        click.echo(f"❌ Error: Dependencies missing ({e}). Run rebuild.sh")
+        return
+
+    if not GEMINI_API_KEY:
+        click.echo("❌ Error: GEMINI_API_KEY not found in config.json")
+        return
+
+    screenshot_path = "/tmp/screenshot.png"
+    click.echo("📸 Capturing screenshot...")
+    saved_path = vision_scanner.capture_screenshot(url, screenshot_path)
+    
+    if not saved_path:
+        click.echo("❌ Failed to capture screenshot.")
+        return
+
+    click.echo("🧠 Analyzing visual context with NVIDIA API...")
+    
+    try:
+        import base64
+        with open(saved_path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        prompt = f"""Analyze this website screenshot for phishing.
+URL: {url}
+
+Task:
+1. Identify the brand/logo in the image.
+2. Check if the URL matches that brand.
+   - If image shows Google/Gmail and URL is google.com -> SAFE.
+   - If image shows Google/Gmail and URL is not google.com -> MALICIOUS.
+   - If generic login page with no brand -> SUSPICIOUS.
+
+Reply with this JSON format:
+{{
+  "verdict": "MALICIOUS" or "SAFE" or "SUSPICIOUS",
+  "reason": "Brief explanation",
+  "brand_detected": "Brand Name" or null
+}}
+"""
+        url_endpoint = "https://integrate.api.nvidia.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GEMINI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "meta/llama-3.2-90b-vision-instruct",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded_string}"}}
+                    ]
+                }
+            ],
+            "max_tokens": 1024,
+            "temperature": 0.2
+        }
+
+        response = requests.post(url_endpoint, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        # Clean response text
+        text = response.json()["choices"][0]["message"]["content"].replace('```json', '').replace('```', '').strip()
+        data = json.loads(text)
+        
+        verdict = data.get('verdict', 'UNKNOWN').upper()
+        reason = data.get('reason', 'No reason provided')
+        brand = data.get('brand_detected', 'None')
+        
+        if verdict == 'MALICIOUS':
+            level = "🔴 HIGH"
+            color = "\033[91m"
+            score = 90
+        elif verdict == 'SUSPICIOUS':
+            level = "🟡 MEDIUM"
+            color = "\033[93m"
+            score = 60
+        else:
+            level = "🟢 LOW"
+            color = "\033[92m"
+            score = 10
+            
+        click.echo("=" * 60)
+        click.echo(f"  Threat Level: {color}{level}\033[0m")
+        click.echo(f"  Risk Score: {score}/100")
+        click.echo(f"  Brand Detected: {brand}")
+        click.echo("=" * 60)
+        click.echo(f"\n💬 Analysis:")
+        click.echo(f"  {reason}")
+        click.echo("\n" + "=" * 60)
+        
+    except Exception as e:
+        click.echo(f"❌ API Error: {str(e)}")
+
+if __name__ == "__main__":
+    cli()

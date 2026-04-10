@@ -1,0 +1,39 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+# Sensitive / Config files with API keys
+setup_env.sh
+config.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Rust build artifacts
+target/
+
+# Node modules (if any)
+node_modules/

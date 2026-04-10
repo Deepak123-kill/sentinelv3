@@ -1,0 +1,9 @@
+{
+    "name": "com.sentinel.host",
+    "description": "Sentinel V2 Native Host",
+    "path": "d:\\download\\projects\\sentinelv2-main\\host-bridge\\launcher.bat",
+    "type": "stdio",
+    "allowed_origins": [
+        "chrome-extension://pbpdjepkmfbbokgcnbbcgmoagpmlohdg/"
+    ]
+}
