@@ -1,7 +1,7 @@
-# Sentinel V2 - Security Analysis Tool
+# Sentinel V3 - Security Analysis Tool
 
 ## Overview
-Sentinel V2 is a comprehensive security analysis tool that scans URLs and files for potential threats using AI-powered analysis and hardware-level isolation.
+Sentinel V3 is a comprehensive security analysis tool that scans URLs and files for potential threats using AI-powered analysis and hardware-level isolation.
 
 ## Features
 
@@ -197,7 +197,7 @@ cargo build --release
 MIT License
 
 ## Contributors
-Sentinel V2 Development Team
+Sentinel V3 Development Team
 
 ## Support
 For issues and feature requests, please open an issue on GitHub.
